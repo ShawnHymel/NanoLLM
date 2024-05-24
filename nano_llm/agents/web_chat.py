@@ -11,7 +11,7 @@ from nano_llm.web import WebServer
 from nano_llm.utils import ArgParser, KeyboardInterrupt
 from nano_llm.plugins import AutoASR
 
-from .voice_chat import VoiceChat
+from nano_llm.agents.voice_chat import VoiceChat
 
 
 class WebChat(VoiceChat):

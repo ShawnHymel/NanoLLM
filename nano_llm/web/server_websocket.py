@@ -3,6 +3,7 @@ import logging
 import ssl
 import struct
 import threading
+import time
 
 from websockets.sync.server import serve as websocket_serve
 from websockets.exceptions import ConnectionClosed
@@ -37,7 +38,8 @@ class WebSocketServer():
         port=49000,
         ssl_cert=None, 
         ssl_key=None,
-        msg_callback=None, 
+        upload_dir=None,
+        msg_callback=None,
         **kwargs
     ):
 
@@ -46,6 +48,7 @@ class WebSocketServer():
         self.port = port
         self.ssl_key = ssl_key
         self.ssl_cert = ssl_cert
+        self.upload_dir = upload_dir
         self.msg_callback = msg_callback
 
         # Initialize variables
@@ -192,13 +195,13 @@ class WebSocketServer():
             # save uploaded files/images to the upload dir
             filename = None
                 
-            # ??? SAVE FILE ???
-            # if self.upload_dir and \
-            #     metadata and \
-            #     (msg_type == WebServer.MESSAGE_FILE or msg_type == WebServer.MESSAGE_IMAGE):
-            #     filename = f"{datetime.datetime.utcfromtimestamp(timestamp/1000).strftime('%Y%m%d_%H%M%S')}.{metadata}"
-            #     filename = os.path.join(self.upload_dir, filename)
-            #     threading.Thread(target=self.save_upload, args=[payload, filename]).start()
+            # Save file or image
+            if self.upload_dir and \
+                metadata and \
+                (msg_type == WebServer.MESSAGE_FILE or msg_type == WebServer.MESSAGE_IMAGE):
+                filename = f"{datetime.datetime.utcfromtimestamp(timestamp/1000).strftime('%Y%m%d_%H%M%S')}.{metadata}"
+                filename = os.path.join(self.upload_dir, filename)
+                threading.Thread(target=self.save_upload, args=[payload, filename]).start()
              
             # decode images in-memory
             if msg_type == self.MESSAGE_IMAGE:
@@ -220,6 +223,14 @@ class WebSocketServer():
                 timestamp=timestamp, 
                 path=filename
             )
+
+    def save_upload(self, payload, path):
+        """
+        Save a file or image upload to the server.
+        """
+        logging.debug(f"saving client upload to {path}")
+        with open(path, 'wb') as file:
+            file.write(payload)
 
     def on_message(
         self, 
@@ -253,6 +264,76 @@ class WebSocketServer():
             for callback in self.msg_callback:
                 callback(payload, payload_size=payload_size, msg_type=msg_type, msg_id=msg_id, 
                          metadata=metadata, timestamp=timestamp, path=path, **kwargs)
+
+    def send_message(self, payload, type=None, timestamp=None):
+        """
+        Send a message to the connected client.
+        """
+
+        # Get the timestamp for the header
+        if timestamp is None:
+            timestamp = time.time() * 1000
+         
+        # Set the payload type
+        encoding = None
+        if type is None:
+            if isinstance(payload, str):
+                type = WebServer.MESSAGE_TEXT
+                encoding = 'utf-8'
+            elif isinstance(payload, bytes):
+                type = WebServer.MESSAGE_BINARY
+            else:
+                type = WebServer.MESSAGE_JSON
+                encoding = 'ascii'
+
+        # Make sure the websocket is connected
+        if self.websocket is None:
+            logging.debug(f"send_message() - no websocket clients connected, dropping " \
+                "{self.msg_type_str(type)} message")
+            return
+
+        # Log message
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"sending {WebServer.msg_type_str(type)} websocket message " \
+                f"(type={type} size={len(payload)})")
+
+        # Ensure that JSON-style payload is converted to a string
+        if type == WebServer.MESSAGE_JSON and not isinstance(payload, str):
+            payload = json.dumps(payload)
+
+        # Encode the payload as bytes
+        if not isinstance(payload, bytes):
+            if encoding is not None:
+                payload = bytes(payload, encoding=encoding)
+            else:
+                payload = bytes(payload)
+
+        # Send the message
+        try:
+            self.websocket.send(b''.join([
+                #
+                # 32-byte message header format:
+                #
+                #   0   uint64  message_id    (message_count_tx)
+                #   8   uint64  timestamp     (milliseconds since Unix epoch)
+                #   16  uint16  magic_number  (42)
+                #   18  uint16  message_type  (0=json, 1=text, >=2 binary)
+                #   20  uint32  payload_size  (in bytes)
+                #   24  uint32  unused        (padding)
+                #   28  uint32  unused        (padding)
+                #
+                struct.pack('!QQHHIII',
+                    self.msg_count_tx,
+                    int(timestamp),
+                    42, type,
+                    len(payload),
+                    0, 0,
+                ),
+                payload
+            ]))
+            self.msg_count_tx += 1
+        except Exception as err:
+            logging.warning(f"failed to send websocket message to client ({err})")
 
 if __name__ == "__main__":
     root = logging.getLogger()
