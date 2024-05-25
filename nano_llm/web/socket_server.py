@@ -1,5 +1,8 @@
+import datetime
 import json
 import logging
+import os
+import PIL
 import ssl
 import struct
 import threading
@@ -50,9 +53,18 @@ class WebSocketServer():
         self.ssl_cert = ssl_cert
         self.upload_dir = upload_dir
         self.msg_callback = msg_callback
+        self.kwargs = kwargs
+
+        # # Save port to kwargs
+        self.kwargs['ws_port'] = port
+
+        # Save callback in list
+        if self.msg_callback and not isinstance(self.msg_callback, list):
+            self.msg_callback = [self.msg_callback]
 
         # Initialize variables
         self.msg_count_rx = 0
+        self.msg_count_tx = 0
 
         # Configure SSL
         self.ssl_context = None
@@ -61,6 +73,7 @@ class WebSocketServer():
             self.ssl_context.load_cert_chain(certfile=self.ssl_cert, keyfile=self.ssl_key)
 
         # Set up websocket server
+        self.websocket = None
         self.ws_server = websocket_serve(
             self.on_websocket, 
             host=self.host, 
@@ -198,7 +211,7 @@ class WebSocketServer():
             # Save file or image
             if self.upload_dir and \
                 metadata and \
-                (msg_type == WebServer.MESSAGE_FILE or msg_type == WebServer.MESSAGE_IMAGE):
+                (msg_type == WebSocketServer.MESSAGE_FILE or msg_type == WebSocketServer.MESSAGE_IMAGE):
                 filename = f"{datetime.datetime.utcfromtimestamp(timestamp/1000).strftime('%Y%m%d_%H%M%S')}.{metadata}"
                 filename = os.path.join(self.upload_dir, filename)
                 threading.Thread(target=self.save_upload, args=[payload, filename]).start()
@@ -262,8 +275,18 @@ class WebSocketServer():
         """
         if self.msg_callback:
             for callback in self.msg_callback:
-                callback(payload, payload_size=payload_size, msg_type=msg_type, msg_id=msg_id, 
-                         metadata=metadata, timestamp=timestamp, path=path, **kwargs)
+                callback(
+                    payload, 
+                    payload_size=payload_size, 
+                    msg_type=msg_type, 
+                    msg_id=msg_id, 
+                    metadata=metadata, 
+                    timestamp=timestamp, 
+                    path=path, 
+                    **kwargs
+                )
+        else:
+           raise NotImplementedError(f"{type(self)} did not implement on_message or have a msg_callback provided")
 
     def send_message(self, payload, type=None, timestamp=None):
         """
@@ -278,12 +301,12 @@ class WebSocketServer():
         encoding = None
         if type is None:
             if isinstance(payload, str):
-                type = WebServer.MESSAGE_TEXT
+                type = WebSocketServer.MESSAGE_TEXT
                 encoding = 'utf-8'
             elif isinstance(payload, bytes):
-                type = WebServer.MESSAGE_BINARY
+                type = WebSocketServer.MESSAGE_BINARY
             else:
-                type = WebServer.MESSAGE_JSON
+                type = WebSocketServer.MESSAGE_JSON
                 encoding = 'ascii'
 
         # Make sure the websocket is connected
@@ -294,11 +317,11 @@ class WebSocketServer():
 
         # Log message
         if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug(f"sending {WebServer.msg_type_str(type)} websocket message " \
+            logging.debug(f"sending {WebSocketServer.msg_type_str(type)} websocket message " \
                 f"(type={type} size={len(payload)})")
 
         # Ensure that JSON-style payload is converted to a string
-        if type == WebServer.MESSAGE_JSON and not isinstance(payload, str):
+        if type == WebSocketServer.MESSAGE_JSON and not isinstance(payload, str):
             payload = json.dumps(payload)
 
         # Encode the payload as bytes
@@ -308,10 +331,12 @@ class WebSocketServer():
             else:
                 payload = bytes(payload)
 
+        print(f"PAYLOAD: {payload}")
+
         # Send the message
         try:
             self.websocket.send(b''.join([
-                #
+
                 # 32-byte message header format:
                 #
                 #   0   uint64  message_id    (message_count_tx)
@@ -321,13 +346,14 @@ class WebSocketServer():
                 #   20  uint32  payload_size  (in bytes)
                 #   24  uint32  unused        (padding)
                 #   28  uint32  unused        (padding)
-                #
                 struct.pack('!QQHHIII',
                     self.msg_count_tx,
                     int(timestamp),
-                    42, type,
+                    42, 
+                    type,
                     len(payload),
-                    0, 0,
+                    0, 
+                    0,
                 ),
                 payload
             ]))
@@ -336,7 +362,19 @@ class WebSocketServer():
             logging.warning(f"failed to send websocket message to client ({err})")
 
 if __name__ == "__main__":
+
+    # Define a test callback that just prints messages
+    def callback(msg, *args, **kwargs):
+        print(f"Callback: {msg}")
+
+    # Set logging
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    wss = WebSocketServer()
+
+    # Start the server
+    wss = WebSocketServer(
+        host="localhost",
+        port=49000,
+        msg_callback=callback,
+    )
     wss.start()

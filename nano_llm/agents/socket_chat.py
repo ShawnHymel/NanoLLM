@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+import logging
+import os
+import re
 import threading
 
-from nano_llm.web import WebSocketServer
+from nano_llm import StopTokens
+from nano_llm.web.socket_server import WebSocketServer
 from nano_llm.utils import ArgParser, KeyboardInterrupt
 from nano_llm.plugins import AutoASR
 from nano_llm.agents.voice_chat import VoiceChat
@@ -33,12 +37,18 @@ class SocketChat(VoiceChat):
         if self.tts:
             self.tts_output.add(self.on_tts_samples, threaded=True)
 
+        # Filters for sanitizing chat HTML
+        self.web_regex = [
+            (re.compile(r'`(.*?)`'), r'<code>\1</code>'),  # code blocks
+            (re.compile(r'\*(.*?)\*'), r'*<i>\1</i>*'),    # emotives inside asterisks
+        ]
+
         # Create the WebSocket server
         self.server = WebSocketServer(
             host=kwargs.get('host', 'localhost'),
             port=kwargs.get('port', 49000),
             msg_callback=self.on_message,
-            **kwargs
+            **kwargs   # Why the fuck does this prevent the server from responding to WS client requests???
         )
 
     def send_chat_history(self):
@@ -50,48 +60,80 @@ class SocketChat(VoiceChat):
         history, num_tokens, max_context_len = self.llm.chat_state
         if self.asr and self.asr_history:
             history.append({'role': 'user', 'text': self.asr_history})
-
-        # Just print to console for now
-        # TODO: find a way to send this back to the client
-        print(history)
+            
+        def web_text(text):
+            text = text.strip()
+            text = text.strip('\n')
+            text = text.replace('\n', '<br/>')
+            text = text.replace('<s>', '')
+            
+            for stop_token in StopTokens:
+                text = text.replace(stop_token, '')
+                
+            for regex, replace in self.web_regex:
+                text = regex.sub(replace, text)
+                
+            return text
+          
+        def web_image(image):
+            if not isinstance(image, str):
+                if not hasattr(image, 'filename'):
+                    return None
+                image = image.filename
+            return os.path.join(self.server.mounts.get(os.path.dirname(image), ''), os.path.basename(image))
+            
+        for entry in history:
+            if 'text' in entry:
+                entry['text'] = web_text(entry['text'])
+            if 'image' in entry:
+                entry['image'] = web_image(entry['image'])
+                
+        self.server.send_message({
+            'chat_history': history,
+            'chat_stats': {
+                'num_tokens': num_tokens,
+                'max_context_len': max_context_len,
+            }
+        })
 
     def on_message(self, msg, msg_type=0, metadata='', **kwargs):
         """
         WebSocket message handler from the client.
         """
         if msg_type == WebSocketServer.MESSAGE_JSON:
+            logging.info(f"JSON received: {msg}")
 
-            # Handle client state message
-            if 'client_state' in msg:
-                if msg['client_state'] == 'connected':
-                    client_init_msg = {
-                        'system_prompt': self.llm.history.system_prompt,
-                        'bot_functions': BotFunctions.generate_docs(prologue=False),
-                        'user_profile': '\n'.join(self.user_profile),
-                    }
+            # # Handle client state message
+            # if 'client_state' in msg:
+            #     if msg['client_state'] == 'connected':
+            #         client_init_msg = {
+            #             'system_prompt': self.llm.history.system_prompt,
+            #             'bot_functions': BotFunctions.generate_docs(prologue=False),
+            #             'user_profile': '\n'.join(self.user_profile),
+            #         }
 
-                    # Add TTS settings if available
-                    if self.tts:
-                        voices = self.tts.voices
+            #         # Add TTS settings if available
+            #         if self.tts:
+            #             voices = self.tts.voices
                         
-                        if len(voices) > 20:
-                            voices = natsort.natsorted(voices)
+            #             if len(voices) > 20:
+            #                 voices = natsort.natsorted(voices)
                   
-                        speakers = self.tts.speakers
+            #             speakers = self.tts.speakers
                         
-                        if len(speakers) > 20:
-                            speakers = natsort.natsorted(speakers)
+            #             if len(speakers) > 20:
+            #                 speakers = natsort.natsorted(speakers)
                             
-                        client_init_msg.update({
-                            'tts_voice': self.tts.voice, 
-                            'tts_voices': voices, 
-                            'tts_speaker': self.tts.speaker, 
-                            'tts_speakers': speakers, 
-                            'tts_rate': self.tts.rate
-                        })
+            #             client_init_msg.update({
+            #                 'tts_voice': self.tts.voice, 
+            #                 'tts_voices': voices, 
+            #                 'tts_speaker': self.tts.speaker, 
+            #                 'tts_speakers': speakers, 
+            #                 'tts_rate': self.tts.rate
+            #             })
 
-                    # Send the client initialization message
-                    self.server.send_message(client_init_msg)
+            #         # Send the client initialization message
+            #         self.server.send_message(client_init_msg)
                     
             # TODO: figure these out
             # if 'system_prompt' in msg:
@@ -168,11 +210,12 @@ class SocketChat(VoiceChat):
         """
         Start the webserver & websocket listening in other threads.
         """
+        print("STARTING WEBSOCKET SERVER")
         super().start()
         self.server.start()
         return self
 
-    Instance = None  # singleton instance
+    # Instance = None  # singleton instance
 
 # Main
 if __name__ == "__main__":
